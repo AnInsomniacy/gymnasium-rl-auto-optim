@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import optuna
 from optuna.pruners import MedianPruner
+from tqdm import tqdm
 
 GAME_ID = "LunarLander-v3"
 CONTINUOUS = True
@@ -26,7 +27,6 @@ def get_file_prefix():
 
 def get_device():
     if not AUTO_DEVICE:
-        print("Using CPU (auto device disabled)")
         return "cpu"
 
     if torch.cuda.is_available():
@@ -42,11 +42,11 @@ def get_device():
 
 
 class TrainingCallback(BaseCallback):
-    def __init__(self, verbose=0):
+    def __init__(self, total_timesteps, verbose=0):
         super(TrainingCallback, self).__init__(verbose)
         self.episode_rewards = []
         self.episode_lengths = []
-        self.last_update_step = 0
+        self.pbar = tqdm(total=total_timesteps, desc="Training", unit="step")
 
     def _on_step(self) -> bool:
         if len(self.locals['infos']) > 0:
@@ -56,19 +56,20 @@ class TrainingCallback(BaseCallback):
                     self.episode_lengths.append(info['episode']['l'])
                     avg_reward = np.mean(self.episode_rewards[-100:]) if len(self.episode_rewards) >= 100 else np.mean(
                         self.episode_rewards)
-                    print(
-                        f"Episode {len(self.episode_rewards):4d} | Reward: {info['episode']['r']:7.2f} | Step: {info['episode']['l']:3d} | Avg100: {avg_reward:6.2f} | Total: {self.num_timesteps}")
+                    self.pbar.set_description(
+                        f"Training | Episodes: {len(self.episode_rewards)} | Avg100: {avg_reward:.2f}")
+                    self.pbar.set_postfix({"Last": f"{info['episode']['r']:.1f}", "Steps": info['episode']['l']})
 
-        if self.num_timesteps - self.last_update_step >= 2048:
-            self.last_update_step = self.num_timesteps
-            updates = self.num_timesteps // 2048
-            print(
-                f"*** {ALGORITHM_NAME.upper()} Update {updates:3d} completed (Final Training) | Total: {self.num_timesteps} ***")
+        self.pbar.update(1)
         return True
+
+    def close(self):
+        if hasattr(self, 'pbar'):
+            self.pbar.close()
 
 
 class HPOCallback(BaseCallback):
-    def __init__(self, trial, eval_freq=10000, pruning_warmup=50000, verbose=0):
+    def __init__(self, trial, total_timesteps, eval_freq=10000, pruning_warmup=50000, verbose=0):
         super(HPOCallback, self).__init__(verbose)
         self.trial = trial
         self.eval_freq = eval_freq
@@ -76,7 +77,7 @@ class HPOCallback(BaseCallback):
         self.episode_rewards = []
         self.episode_lengths = []
         self.last_eval_step = 0
-        self.last_update_step = 0
+        self.pbar = tqdm(total=total_timesteps, desc=f"Trial {trial.number + 1}", unit="step")
 
     def _on_step(self) -> bool:
         if len(self.locals['infos']) > 0:
@@ -86,14 +87,9 @@ class HPOCallback(BaseCallback):
                     self.episode_lengths.append(info['episode']['l'])
                     avg_reward = np.mean(self.episode_rewards[-100:]) if len(self.episode_rewards) >= 100 else np.mean(
                         self.episode_rewards)
-                    print(
-                        f"Episode {len(self.episode_rewards):4d} | Reward: {info['episode']['r']:7.2f} | Step: {info['episode']['l']:3d} | Avg100: {avg_reward:6.2f} | Total: {self.num_timesteps}")
-
-        if self.num_timesteps - self.last_update_step >= 2048:
-            self.last_update_step = self.num_timesteps
-            updates = self.num_timesteps // 2048
-            print(
-                f"*** {ALGORITHM_NAME.upper()} Update {updates:3d} completed (Trial {self.trial.number + 1}) | Total: {self.num_timesteps} ***")
+                    self.pbar.set_description(
+                        f"Trial {self.trial.number + 1} | Episodes: {len(self.episode_rewards)} | Avg100: {avg_reward:.2f}")
+                    self.pbar.set_postfix({"Last": f"{info['episode']['r']:.1f}", "Steps": info['episode']['l']})
 
         if self.num_timesteps - self.last_eval_step >= self.eval_freq:
             self.last_eval_step = self.num_timesteps
@@ -102,12 +98,15 @@ class HPOCallback(BaseCallback):
                 if self.num_timesteps >= self.pruning_warmup:
                     self.trial.report(avg_reward, self.num_timesteps)
                     if self.trial.should_prune():
-                        print(
-                            f"Trial {self.trial.number + 1} pruned at step {self.num_timesteps} (avg: {avg_reward:.2f}) | Total: {self.num_timesteps}")
+                        self.pbar.close()
                         raise optuna.exceptions.TrialPruned()
-                print(
-                    f"Trial Progress: Step {self.num_timesteps:6d} | Episodes: {len(self.episode_rewards):4d} | Avg10: {avg_reward:6.2f} | Total: {self.num_timesteps}")
+
+        self.pbar.update(1)
         return True
+
+    def close(self):
+        if hasattr(self, 'pbar'):
+            self.pbar.close()
 
 
 class RLAgent:
@@ -133,50 +132,49 @@ class RLAgent:
             sys.exit(0)
 
     def train_with_params(self, params, total_timesteps, trial=None, pruning_warmup=50000, test_episodes=5):
-        if trial is None:
-            signal.signal(signal.SIGINT, self.save_emergency_final)
-
-        self.env = self.create_env()
-        device = get_device()
-
-        if trial:
-            callback = HPOCallback(trial, pruning_warmup=pruning_warmup)
-            print(f"\nStarting Trial {trial.number + 1} training...")
-        else:
-            callback = TrainingCallback()
-            print(f"\nStarting final model training...")
-
-        policy_kwargs = {
-            "net_arch": params['net_arch'],
-            "activation_fn": nn.Tanh,
-            "ortho_init": True
-        }
-
-        self.model = PPO(
-            "MlpPolicy",
-            self.env,
-            learning_rate=params['learning_rate'],
-            n_steps=params['n_steps'],
-            batch_size=params['batch_size'],
-            n_epochs=params['n_epochs'],
-            gamma=params['gamma'],
-            gae_lambda=0.95,
-            clip_range=params['clip_range'],
-            ent_coef=params['ent_coef'],
-            vf_coef=0.5,
-            max_grad_norm=0.5,
-            normalize_advantage=True,
-            policy_kwargs=policy_kwargs,
-            device=device,
-            verbose=0
-        )
-
+        callback = None
         try:
-            print(
-                f"Training: {total_timesteps:,} steps | LR: {params['learning_rate']:.2e} | Arch: {params['net_arch']} | Starting...")
-            self.model.learn(total_timesteps=total_timesteps, callback=callback)
+            if trial is None:
+                signal.signal(signal.SIGINT, self.save_emergency_final)
 
-            print(f"\nEvaluating with {test_episodes} test episodes | Total: {total_timesteps}...")
+            self.env = self.create_env()
+            device = get_device()
+
+            if trial:
+                callback = HPOCallback(trial, total_timesteps, pruning_warmup=pruning_warmup)
+            else:
+                callback = TrainingCallback(total_timesteps)
+                print(f"\nStarting final model training...")
+
+            policy_kwargs = {
+                "net_arch": params['net_arch'],
+                "activation_fn": nn.Tanh,
+                "ortho_init": True
+            }
+
+            self.model = PPO(
+                "MlpPolicy",
+                self.env,
+                learning_rate=params['learning_rate'],
+                n_steps=params['n_steps'],
+                batch_size=params['batch_size'],
+                n_epochs=params['n_epochs'],
+                gamma=params['gamma'],
+                gae_lambda=0.95,
+                clip_range=params['clip_range'],
+                ent_coef=params['ent_coef'],
+                vf_coef=0.5,
+                max_grad_norm=0.5,
+                normalize_advantage=True,
+                policy_kwargs=policy_kwargs,
+                device=device,
+                verbose=0
+            )
+
+            self.model.learn(total_timesteps=total_timesteps, callback=callback)
+            callback.close()
+
+            print(f"\nEvaluating with {test_episodes} test episodes...")
             total_rewards = []
             for i in range(test_episodes):
                 obs = self.env.reset()
@@ -188,32 +186,36 @@ class RLAgent:
                     episode_reward += reward[0]
                     if done:
                         total_rewards.append(episode_reward)
-                        print(f"  Test {i + 1}/{test_episodes}: {episode_reward:.2f} | Total: {total_timesteps}")
+                        print(f"  Test {i + 1}/{test_episodes}: {episode_reward:.2f}")
                         break
 
             avg_reward = np.mean(total_rewards)
             if trial:
-                print(f"Trial {trial.number + 1} completed | Score: {avg_reward:.2f} | Total: {total_timesteps}")
+                print(f"Trial {trial.number + 1} completed | Score: {avg_reward:.2f}")
             else:
-                print(f"Final training completed | Score: {avg_reward:.2f} | Total: {total_timesteps}")
+                print(f"Final training completed | Score: {avg_reward:.2f}")
             return avg_reward
 
         except optuna.exceptions.TrialPruned:
-            print(f"Trial {trial.number + 1} was pruned early | Total: {self.model.num_timesteps if self.model else 0}")
+            print(f"Trial {trial.number + 1} was pruned early")
             return -1000.0
         except KeyboardInterrupt:
+            if callback:
+                callback.close()
             current_steps = self.model.num_timesteps if self.model else 0
             if trial is None:
-                print(f"\nFinal training interrupted | Total: {current_steps}")
+                print(f"\nFinal training interrupted at step {current_steps}")
                 if self.model:
                     model_name = f"{get_file_prefix()}_final"
                     self.model.save(model_name)
                     print(f"Model saved to '{model_name}.zip'")
             else:
-                print(f"\nTrial {trial.number + 1} interrupted | Total: {current_steps}")
+                print(f"\nTrial {trial.number + 1} interrupted at step {current_steps}")
                 raise
             return -1000.0
         finally:
+            if callback:
+                callback.close()
             if self.env:
                 self.env.close()
 
@@ -247,11 +249,31 @@ def objective(trial, hpo_config):
     print(f"Trial {trial.number + 1} - Testing Parameters")
     print(f"{'=' * 60}")
     print(
-        f"LR: {params['learning_rate']:.2e} | Steps: {params['n_steps']} | Batch: {params['batch_size']} | Epochs: {params['n_epochs']}")
+        f"{'LR':<8}: {params['learning_rate']:<10.2e} {'Steps':<8}: {params['n_steps']:<10} {'Batch':<8}: {params['batch_size']:<10} {'Epochs':<8}: {params['n_epochs']}")
+    print(
+        f"{'Gamma':<8}: {params['gamma']:<10.3f} {'Clip':<8}: {params['clip_range']:<10.2f} {'Arch':<8}: {str(params['net_arch']):<10} {'Ent':<8}: {params['ent_coef']:.2e}")
     if batch_size != batch_size_raw:
         print(f"Note: Batch size adjusted from {batch_size_raw} to {batch_size} (n_steps constraint)")
-    print(
-        f"Gamma: {params['gamma']:.3f} | Clip: {params['clip_range']:.2f} | Arch: {params['net_arch']} | Ent: {params['ent_coef']:.2e}")
+
+    study = trial.study
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if completed_trials:
+        best_trial = max(completed_trials, key=lambda t: t.value)
+        print(f"\n{'=' * 60}")
+        print(f"Best So Far: Trial {best_trial.number + 1} - Score: {best_trial.value:.2f}")
+        print(f"{'=' * 60}")
+        best_arch = best_trial.params['net_arch']
+        if isinstance(best_arch, str):
+            net_arch_map = {"32x32": [32, 32], "64x64": [64, 64], "128x128": [128, 128], "256x256": [256, 256]}
+            best_arch = net_arch_map[best_arch]
+        print(
+            f"{'LR':<8}: {best_trial.params['learning_rate']:<10.2e} {'Steps':<8}: {best_trial.params['n_steps']:<10} {'Batch':<8}: {best_trial.params['batch_size']:<10} {'Epochs':<8}: {best_trial.params['n_epochs']}")
+        print(
+            f"{'Gamma':<8}: {best_trial.params['gamma']:<10.3f} {'Clip':<8}: {best_trial.params['clip_range']:<10.2f} {'Arch':<8}: {str(best_arch):<10} {'Ent':<8}: {best_trial.params['ent_coef']:.2e}")
+    else:
+        print(f"\n{'=' * 60}")
+        print(f"Best So Far: No previous trials")
+        print(f"{'=' * 60}")
 
     agent = RLAgent(render_mode=None)
     return agent.train_with_params(
@@ -405,10 +427,12 @@ def train_with_best_params(final_timesteps=200000):
         agent.env = agent.create_env()
         agent.model = PPO.load(FINAL_MODEL, env=agent.env, device=device)
 
+        callback = None
         try:
             print(f"Continuing training for {final_timesteps:,} additional steps...")
-            callback = TrainingCallback()
+            callback = TrainingCallback(final_timesteps)
             agent.model.learn(total_timesteps=final_timesteps, callback=callback)
+            callback.close()
 
             print(f"\nEvaluating continued training with 5 test episodes...")
             total_rewards = []
@@ -422,19 +446,23 @@ def train_with_best_params(final_timesteps=200000):
                     episode_reward += reward[0]
                     if done:
                         total_rewards.append(episode_reward)
-                        print(f"  Test {i + 1}/5: {episode_reward:.2f} | Total: {final_timesteps}")
+                        print(f"  Test {i + 1}/5: {episode_reward:.2f}")
                         break
 
             final_score = np.mean(total_rewards)
             agent.model.save(FINAL_MODEL)
-            print(f"Model updated! Score: {final_score:.2f} | Total: {final_timesteps}")
+            print(f"Model updated! Score: {final_score:.2f}")
 
         except KeyboardInterrupt:
-            print(f"Training interrupted | Total: {final_timesteps}")
+            if callback:
+                callback.close()
+            print(f"Training interrupted")
             if agent.model:
                 agent.model.save(FINAL_MODEL)
                 print(f"Model saved to '{FINAL_MODEL}.zip'")
         finally:
+            if callback:
+                callback.close()
             if agent.env:
                 agent.env.close()
     else:
@@ -446,22 +474,22 @@ def train_with_best_params(final_timesteps=200000):
         try:
             final_score = agent.train_with_params(best_params, total_timesteps=final_timesteps)
             agent.model.save(FINAL_MODEL)
-            print(f"Final model saved! Score: {final_score:.2f} | Total: {final_timesteps}")
+            print(f"Final model saved! Score: {final_score:.2f}")
         except KeyboardInterrupt:
-            print(f"Training interrupted | Total: {final_timesteps}")
+            print(f"Training interrupted")
             if agent.model:
                 agent.model.save(FINAL_MODEL)
                 print(f"Model saved to '{FINAL_MODEL}.zip'")
 
 
-def test_model():
+def test_model(test_episodes=10):
     model_file = f"{get_file_prefix()}_final.zip"
 
     if not os.path.exists(model_file):
         print(f"No {model_file} found. Train first!")
         return
 
-    print("Testing model...")
+    print(f"Testing model with {test_episodes} episodes...")
 
     agent = RLAgent(render_mode="human")
     agent.env = agent.create_env()
@@ -471,7 +499,7 @@ def test_model():
     total_rewards = []
     successes = 0
 
-    for episode in range(10):
+    for episode in range(test_episodes):
         obs = agent.env.reset()
         episode_reward = 0
         done = False
@@ -493,10 +521,11 @@ def test_model():
                 else:
                     status = "CRASH"
 
-                print(f"Test {episode + 1:2d}/10 | Score: {episode_reward:7.2f} | {status}")
+                print(f"Test {episode + 1:2d}/{test_episodes} | Score: {episode_reward:7.2f} | {status}")
                 break
 
-    print(f"\nResults: Avg: {np.mean(total_rewards):.2f} | Success: {successes}/10 ({100 * successes / 10:.1f}%)")
+    print(
+        f"\nResults: Avg: {np.mean(total_rewards):.2f} | Success: {successes}/{test_episodes} ({100 * successes / test_episodes:.1f}%)")
     agent.env.close()
 
 
@@ -509,6 +538,7 @@ def main():
     }
 
     FINAL_TIMESTEPS = 200000
+    TEST_EPISODES = 15
 
     print(f"{GAME_ID} {ALGORITHM_NAME.upper()} + Optuna HPO")
     print("=" * 40)
@@ -518,11 +548,17 @@ def main():
     for key, value in HPO_CONFIG.items():
         print(f"  {key}: {value}")
     print(f"  final_timesteps: {FINAL_TIMESTEPS:,}")
+    print(f"  test_episodes: {TEST_EPISODES}")
     print("=" * 40)
     print(f"\n{ALGORITHM_NAME.upper()} Parameter Ranges (RL Zoo Standards):")
     print("  learning_rate: 1e-5 to 1e-1 (log)")
-    print("  ent_coef: 1e-8 to 1e-2 (log)")
+    print("  n_steps: [256, 512, 1024, 2048]")
     print("  batch_size: [32, 64, 128, 256, 512]")
+    print("  n_epochs: [3, 5, 10, 20]")
+    print("  gamma: 0.98 to 0.999")
+    print("  clip_range: 0.1 to 0.3")
+    print("  net_arch: [32x32, 64x64, 128x128, 256x256]")
+    print("  ent_coef: 1e-8 to 1e-2 (log)")
     print("=" * 40)
 
     print("\nSelect Mode:")
@@ -543,7 +579,7 @@ def main():
             train_with_best_params(FINAL_TIMESTEPS)
             break
         elif mode == "3":
-            test_model()
+            test_model(TEST_EPISODES)
             break
         elif mode == "4":
             print("Exit")
