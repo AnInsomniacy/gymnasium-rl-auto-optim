@@ -565,12 +565,12 @@ def main():
 
         # HPO配置（超参数优化）
         'n_trials': 50,  # 尝试多少组不同的参数组合
-        'hpo_timesteps': 50000,  # 每组参数试验训练多少步
-        'pruning_warmup': 10000,  # 多少步后开始剪枝（提前停止差的试验）
+        'hpo_timesteps': 100000,  # 每组参数试验训练多少步
+        'pruning_warmup': 20000,  # 多少步后开始剪枝（提前停止差的试验）
         'hpo_test_episodes': 10,  # 每组参数训练完后测试几个回合
 
         # 最终训练配置
-        'final_timesteps': 200000,  # 用最佳参数最终训练多少步
+        'final_timesteps': 2000000,  # 用最佳参数最终训练多少步
         'test_episodes': 20  # 最终模型测试多少个回合
     }
 
