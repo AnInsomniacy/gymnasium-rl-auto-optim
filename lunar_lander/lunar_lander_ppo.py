@@ -15,18 +15,13 @@ import optuna
 from optuna.pruners import MedianPruner
 from tqdm import tqdm
 
-GAME_ID = "LunarLander-v3"
-CONTINUOUS = True
-ALGORITHM_NAME = "ppo"
-AUTO_DEVICE = False
+
+def get_file_prefix(config):
+    return f"{config['game_id'].replace('-', '_').lower()}_{config['algorithm_name']}"
 
 
-def get_file_prefix():
-    return f"{GAME_ID.replace('-', '_').lower()}_{ALGORITHM_NAME}"
-
-
-def get_device():
-    if not AUTO_DEVICE:
+def get_device(config):
+    if not config['auto_device']:
         return "cpu"
 
     if torch.cuda.is_available():
@@ -42,11 +37,11 @@ def get_device():
 
 
 class TrainingCallback(BaseCallback):
-    def __init__(self, total_timesteps, verbose=0):
+    def __init__(self, pbar, verbose=0):
         super(TrainingCallback, self).__init__(verbose)
         self.episode_rewards = []
         self.episode_lengths = []
-        self.pbar = tqdm(total=total_timesteps, desc="Training", unit="step")
+        self.pbar = pbar
 
     def _on_step(self) -> bool:
         if len(self.locals['infos']) > 0:
@@ -63,13 +58,9 @@ class TrainingCallback(BaseCallback):
         self.pbar.update(1)
         return True
 
-    def close(self):
-        if hasattr(self, 'pbar'):
-            self.pbar.close()
-
 
 class HPOCallback(BaseCallback):
-    def __init__(self, trial, total_timesteps, eval_freq=10000, pruning_warmup=50000, verbose=0):
+    def __init__(self, trial, pbar, eval_freq=10000, pruning_warmup=50000, verbose=0):
         super(HPOCallback, self).__init__(verbose)
         self.trial = trial
         self.eval_freq = eval_freq
@@ -77,7 +68,7 @@ class HPOCallback(BaseCallback):
         self.episode_rewards = []
         self.episode_lengths = []
         self.last_eval_step = 0
-        self.pbar = tqdm(total=total_timesteps, desc=f"Trial {trial.number + 1}", unit="step")
+        self.pbar = pbar
 
     def _on_step(self) -> bool:
         if len(self.locals['infos']) > 0:
@@ -104,26 +95,27 @@ class HPOCallback(BaseCallback):
         self.pbar.update(1)
         return True
 
-    def close(self):
-        if hasattr(self, 'pbar'):
-            self.pbar.close()
-
 
 class RLAgent:
-    def __init__(self, render_mode):
+    def __init__(self, render_mode, config):
         self.render_mode = render_mode
-        self.continuous = CONTINUOUS
+        self.config = config
         self.model = None
         self.env = None
 
     def create_env(self):
-        env = gym.make(GAME_ID, continuous=self.continuous, render_mode=self.render_mode)
+        env = gym.make(
+            self.config['game_id'],
+            continuous=self.config['continuous'],
+            render_mode=self.render_mode,
+            max_episode_steps=self.config['max_episode_steps']
+        )
         env = Monitor(env)
         return DummyVecEnv([lambda: env])
 
     def save_emergency_final(self, signum=None, frame=None):
         if self.model:
-            model_name = f"{get_file_prefix()}_final"
+            model_name = f"{get_file_prefix(self.config)}_final"
             self.model.save(model_name)
             print(f"\nEmergency save: Model saved to '{model_name}.zip'")
         if signum:
@@ -132,19 +124,13 @@ class RLAgent:
             sys.exit(0)
 
     def train_with_params(self, params, total_timesteps, trial=None, pruning_warmup=50000, test_episodes=5):
-        callback = None
+        pbar = None
         try:
             if trial is None:
                 signal.signal(signal.SIGINT, self.save_emergency_final)
 
             self.env = self.create_env()
-            device = get_device()
-
-            if trial:
-                callback = HPOCallback(trial, total_timesteps, pruning_warmup=pruning_warmup)
-            else:
-                callback = TrainingCallback(total_timesteps)
-                print(f"\nStarting final model training...")
+            device = get_device(self.config)
 
             policy_kwargs = {
                 "net_arch": params['net_arch'],
@@ -171,12 +157,21 @@ class RLAgent:
                 verbose=0
             )
 
+            if trial:
+                pbar = tqdm(total=total_timesteps, desc=f"Trial {trial.number + 1}", unit="step")
+                callback = HPOCallback(trial, pbar, pruning_warmup=pruning_warmup)
+            else:
+                pbar = tqdm(total=total_timesteps, desc="Training", unit="step")
+                callback = TrainingCallback(pbar)
+                print(f"\nStarting final model training...")
+
             self.model.learn(total_timesteps=total_timesteps, callback=callback)
-            callback.close()
+            pbar.close()
 
             print(f"\nEvaluating with {test_episodes} test episodes...")
             total_rewards = []
-            for i in range(test_episodes):
+            test_pbar = tqdm(range(test_episodes), desc="Testing", unit="episode")
+            for i in test_pbar:
                 obs = self.env.reset()
                 episode_reward = 0
                 done = False
@@ -186,8 +181,9 @@ class RLAgent:
                     episode_reward += reward[0]
                     if done:
                         total_rewards.append(episode_reward)
-                        print(f"  Test {i + 1}/{test_episodes}: {episode_reward:.2f}")
+                        test_pbar.set_postfix({"Score": f"{episode_reward:.2f}"})
                         break
+            test_pbar.close()
 
             avg_reward = np.mean(total_rewards)
             if trial:
@@ -197,16 +193,18 @@ class RLAgent:
             return avg_reward
 
         except optuna.exceptions.TrialPruned:
+            if pbar:
+                pbar.close()
             print(f"Trial {trial.number + 1} was pruned early")
             return -1000.0
         except KeyboardInterrupt:
-            if callback:
-                callback.close()
+            if pbar:
+                pbar.close()
             current_steps = self.model.num_timesteps if self.model else 0
             if trial is None:
                 print(f"\nFinal training interrupted at step {current_steps}")
                 if self.model:
-                    model_name = f"{get_file_prefix()}_final"
+                    model_name = f"{get_file_prefix(self.config)}_final"
                     self.model.save(model_name)
                     print(f"Model saved to '{model_name}.zip'")
             else:
@@ -214,13 +212,18 @@ class RLAgent:
                 raise
             return -1000.0
         finally:
-            if callback:
-                callback.close()
+            if pbar:
+                pbar.close()
             if self.env:
                 self.env.close()
 
 
-def objective(trial, hpo_config):
+def get_valid_batch_sizes(n_steps):
+    all_batch_sizes = [32, 64, 128, 256, 512, 1024, 2048]
+    return [bs for bs in all_batch_sizes if bs <= n_steps and n_steps % bs == 0]
+
+
+def objective(trial, config):
     net_arch_map = {
         "32x32": [32, 32],
         "64x64": [64, 64],
@@ -230,9 +233,13 @@ def objective(trial, hpo_config):
 
     net_arch_str = trial.suggest_categorical('net_arch', ["32x32", "64x64", "128x128", "256x256"])
     n_steps = trial.suggest_categorical('n_steps', [256, 512, 1024, 2048])
-    batch_size_raw = trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512])
+    batch_size_raw = trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512, 1024, 2048])
 
-    batch_size = min(batch_size_raw, n_steps)
+    valid_batch_sizes = get_valid_batch_sizes(n_steps)
+    if batch_size_raw not in valid_batch_sizes:
+        batch_size = min([bs for bs in valid_batch_sizes if bs <= batch_size_raw], default=valid_batch_sizes[0])
+    else:
+        batch_size = batch_size_raw
 
     params = {
         'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-1, log=True),
@@ -245,8 +252,16 @@ def objective(trial, hpo_config):
         'ent_coef': trial.suggest_float('ent_coef', 1e-8, 1e-2, log=True)
     }
 
+    study = trial.study
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+
     print(f"\n{'=' * 60}")
     print(f"Trial {trial.number + 1} - Testing Parameters")
+    if completed_trials:
+        best_trial = max(completed_trials, key=lambda t: t.value)
+        print(f"Best So Far: Trial {best_trial.number + 1} - Score: {best_trial.value:.2f}")
+    else:
+        print(f"Best So Far: No previous trials")
     print(f"{'=' * 60}")
     print(
         f"{'LR':<8}: {params['learning_rate']:<10.2e} {'Steps':<8}: {params['n_steps']:<10} {'Batch':<8}: {params['batch_size']:<10} {'Epochs':<8}: {params['n_epochs']}")
@@ -255,44 +270,25 @@ def objective(trial, hpo_config):
     if batch_size != batch_size_raw:
         print(f"Note: Batch size adjusted from {batch_size_raw} to {batch_size} (n_steps constraint)")
 
-    study = trial.study
-    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    if completed_trials:
-        best_trial = max(completed_trials, key=lambda t: t.value)
-        print(f"\n{'=' * 60}")
-        print(f"Best So Far: Trial {best_trial.number + 1} - Score: {best_trial.value:.2f}")
-        print(f"{'=' * 60}")
-        best_arch = best_trial.params['net_arch']
-        if isinstance(best_arch, str):
-            net_arch_map = {"32x32": [32, 32], "64x64": [64, 64], "128x128": [128, 128], "256x256": [256, 256]}
-            best_arch = net_arch_map[best_arch]
-        print(
-            f"{'LR':<8}: {best_trial.params['learning_rate']:<10.2e} {'Steps':<8}: {best_trial.params['n_steps']:<10} {'Batch':<8}: {best_trial.params['batch_size']:<10} {'Epochs':<8}: {best_trial.params['n_epochs']}")
-        print(
-            f"{'Gamma':<8}: {best_trial.params['gamma']:<10.3f} {'Clip':<8}: {best_trial.params['clip_range']:<10.2f} {'Arch':<8}: {str(best_arch):<10} {'Ent':<8}: {best_trial.params['ent_coef']:.2e}")
-    else:
-        print(f"\n{'=' * 60}")
-        print(f"Best So Far: No previous trials")
-        print(f"{'=' * 60}")
-
-    agent = RLAgent(render_mode=None)
+    agent = RLAgent(render_mode=None, config=config)
     return agent.train_with_params(
         params,
-        total_timesteps=hpo_config['hpo_timesteps'],
+        total_timesteps=config['hpo_timesteps'],
         trial=trial,
-        pruning_warmup=hpo_config['pruning_warmup'],
-        test_episodes=hpo_config['test_episodes']
+        pruning_warmup=config['pruning_warmup'],
+        test_episodes=config['hpo_test_episodes']
     )
 
 
-def run_hpo(hpo_config):
+def run_hpo(config):
     optuna.logging.set_verbosity(optuna.logging.ERROR)
 
-    STUDY_FILE = f"{get_file_prefix()}_study.pkl"
+    STUDY_FILE = f"{get_file_prefix(config)}_study.pkl"
 
-    print(f"Starting HPO for {GAME_ID} {ALGORITHM_NAME.upper()}")
-    print(f"Environment: {GAME_ID} | Continuous: {CONTINUOUS} | Algorithm: {ALGORITHM_NAME.upper()}")
-    print(f"Config: {hpo_config['n_trials']} trials x {hpo_config['hpo_timesteps']:,} steps")
+    print(f"Starting HPO for {config['game_id']} {config['algorithm_name'].upper()}")
+    print(
+        f"Environment: {config['game_id']} | Continuous: {config['continuous']} | Algorithm: {config['algorithm_name'].upper()}")
+    print(f"Config: {config['n_trials']} trials x {config['hpo_timesteps']:,} steps")
     print("Press Ctrl+C to interrupt and save progress")
 
     if os.path.exists(STUDY_FILE):
@@ -303,7 +299,7 @@ def run_hpo(hpo_config):
         if completed_count > 0:
             print(f"Current best score: {study.best_value:.2f}")
 
-        remaining = max(0, hpo_config['n_trials'] - len(study.trials))
+        remaining = max(0, config['n_trials'] - len(study.trials))
         if remaining == 0:
             print("All trials completed!")
             return study.best_params if completed_count > 0 else None
@@ -314,16 +310,26 @@ def run_hpo(hpo_config):
             pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=10)
         )
         print("Created new HPO study")
-        remaining = hpo_config['n_trials']
+        remaining = config['n_trials']
 
     try:
-        study.optimize(lambda trial: objective(trial, hpo_config), n_trials=remaining)
+        study.optimize(lambda trial: objective(trial, config), n_trials=remaining)
 
         completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-        print(f"\nHPO completed! Best score: {study.best_value:.2f}")
+        best_trial = max(completed_trials, key=lambda t: t.value)
+        print(f"\nHPO completed! Best score: {study.best_value:.2f} (Trial {best_trial.number + 1})")
         print("Best parameters:")
-        for key, value in study.best_params.items():
-            print(f"  {key}: {value}")
+
+        best_params = study.best_params
+        best_arch = best_params['net_arch']
+        if isinstance(best_arch, str):
+            net_arch_map = {"32x32": [32, 32], "64x64": [64, 64], "128x128": [128, 128], "256x256": [256, 256]}
+            best_arch = net_arch_map[best_arch]
+
+        print(
+            f"{'LR':<8}: {best_params['learning_rate']:<10.2e} {'Steps':<8}: {best_params['n_steps']:<10} {'Batch':<8}: {best_params['batch_size']:<10} {'Epochs':<8}: {best_params['n_epochs']}")
+        print(
+            f"{'Gamma':<8}: {best_params['gamma']:<10.3f} {'Clip':<8}: {best_params['clip_range']:<10.2f} {'Arch':<8}: {str(best_arch):<10} {'Ent':<8}: {best_params['ent_coef']:.2e}")
 
         best_params_to_save = study.best_params.copy()
         net_arch_map = {
@@ -335,7 +341,7 @@ def run_hpo(hpo_config):
         if 'net_arch' in best_params_to_save and isinstance(best_params_to_save['net_arch'], str):
             best_params_to_save['net_arch'] = net_arch_map[best_params_to_save['net_arch']]
 
-        params_file = f"{get_file_prefix()}_params.json"
+        params_file = f"{get_file_prefix(config)}_params.json"
         with open(params_file, "w") as f:
             json.dump(best_params_to_save, f, indent=2)
         print(f"Best parameters saved to '{params_file}'")
@@ -347,11 +353,21 @@ def run_hpo(hpo_config):
         total_trials = len(study.trials)
 
         if completed_trials:
+            best_trial = max(completed_trials, key=lambda t: t.value)
             print(f"Progress: {len(completed_trials)}/{total_trials} trials completed")
-            print(f"Current best score: {study.best_value:.2f}")
+            print(f"Current best score: {study.best_value:.2f} (Trial {best_trial.number + 1})")
             print("Current best parameters:")
-            for key, value in study.best_params.items():
-                print(f"  {key}: {value}")
+
+            best_params = study.best_params
+            best_arch = best_params['net_arch']
+            if isinstance(best_arch, str):
+                net_arch_map = {"32x32": [32, 32], "64x64": [64, 64], "128x128": [128, 128], "256x256": [256, 256]}
+                best_arch = net_arch_map[best_arch]
+
+            print(
+                f"{'LR':<8}: {best_params['learning_rate']:<10.2e} {'Steps':<8}: {best_params['n_steps']:<10} {'Batch':<8}: {best_params['batch_size']:<10} {'Epochs':<8}: {best_params['n_epochs']}")
+            print(
+                f"{'Gamma':<8}: {best_params['gamma']:<10.3f} {'Clip':<8}: {best_params['clip_range']:<10.2f} {'Arch':<8}: {str(best_arch):<10} {'Ent':<8}: {best_params['ent_coef']:.2e}")
 
             best_params_to_save = study.best_params.copy()
             net_arch_map = {
@@ -363,7 +379,7 @@ def run_hpo(hpo_config):
             if 'net_arch' in best_params_to_save and isinstance(best_params_to_save['net_arch'], str):
                 best_params_to_save['net_arch'] = net_arch_map[best_params_to_save['net_arch']]
 
-            params_file = f"{get_file_prefix()}_params.json"
+            params_file = f"{get_file_prefix(config)}_params.json"
             with open(params_file, "w") as f:
                 json.dump(best_params_to_save, f, indent=2)
             print(f"Current best saved to '{params_file}'")
@@ -397,9 +413,9 @@ def run_hpo(hpo_config):
     return study.best_params if completed_trials else None
 
 
-def train_with_best_params(final_timesteps=200000):
-    FINAL_MODEL = f"{get_file_prefix()}_final"
-    params_file = f"{get_file_prefix()}_params.json"
+def train_with_best_params(config):
+    FINAL_MODEL = f"{get_file_prefix(config)}_final"
+    params_file = f"{get_file_prefix(config)}_params.json"
 
     if not os.path.exists(params_file):
         print(f"No {params_file} found. Run HPO first!")
@@ -419,24 +435,28 @@ def train_with_best_params(final_timesteps=200000):
         best_params['net_arch'] = net_arch_map[best_params['net_arch']]
         print(f"Fixed net_arch format: {best_params['net_arch']}")
 
-    agent = RLAgent(render_mode=None)
-    device = get_device()
+    agent = RLAgent(render_mode=None, config=config)
+    device = get_device(config)
+
+    final_timesteps = config['final_timesteps']
 
     if os.path.exists(f"{FINAL_MODEL}.zip"):
         print("Continuing training of existing model")
         agent.env = agent.create_env()
         agent.model = PPO.load(FINAL_MODEL, env=agent.env, device=device)
 
-        callback = None
+        pbar = None
         try:
             print(f"Continuing training for {final_timesteps:,} additional steps...")
-            callback = TrainingCallback(final_timesteps)
+            pbar = tqdm(total=final_timesteps, desc="Training", unit="step")
+            callback = TrainingCallback(pbar)
             agent.model.learn(total_timesteps=final_timesteps, callback=callback)
-            callback.close()
+            pbar.close()
 
             print(f"\nEvaluating continued training with 5 test episodes...")
             total_rewards = []
-            for i in range(5):
+            test_pbar = tqdm(range(5), desc="Testing", unit="episode")
+            for i in test_pbar:
                 obs = agent.env.reset()
                 episode_reward = 0
                 done = False
@@ -446,23 +466,24 @@ def train_with_best_params(final_timesteps=200000):
                     episode_reward += reward[0]
                     if done:
                         total_rewards.append(episode_reward)
-                        print(f"  Test {i + 1}/5: {episode_reward:.2f}")
+                        test_pbar.set_postfix({"Score": f"{episode_reward:.2f}"})
                         break
+            test_pbar.close()
 
             final_score = np.mean(total_rewards)
             agent.model.save(FINAL_MODEL)
             print(f"Model updated! Score: {final_score:.2f}")
 
         except KeyboardInterrupt:
-            if callback:
-                callback.close()
+            if pbar:
+                pbar.close()
             print(f"Training interrupted")
             if agent.model:
                 agent.model.save(FINAL_MODEL)
                 print(f"Model saved to '{FINAL_MODEL}.zip'")
         finally:
-            if callback:
-                callback.close()
+            if pbar:
+                pbar.close()
             if agent.env:
                 agent.env.close()
     else:
@@ -482,24 +503,25 @@ def train_with_best_params(final_timesteps=200000):
                 print(f"Model saved to '{FINAL_MODEL}.zip'")
 
 
-def test_model(test_episodes=10):
-    model_file = f"{get_file_prefix()}_final.zip"
+def test_model(config):
+    model_file = f"{get_file_prefix(config)}_final.zip"
 
     if not os.path.exists(model_file):
         print(f"No {model_file} found. Train first!")
         return
 
-    print(f"Testing model with {test_episodes} episodes...")
+    print(f"Testing model with {config['test_episodes']} episodes...")
 
-    agent = RLAgent(render_mode="human")
+    agent = RLAgent(render_mode="human", config=config)
     agent.env = agent.create_env()
-    device = get_device()
-    agent.model = PPO.load(f"{get_file_prefix()}_final", device=device)
+    device = get_device(config)
+    agent.model = PPO.load(f"{get_file_prefix(config)}_final", device=device)
 
     total_rewards = []
     successes = 0
 
-    for episode in range(test_episodes):
+    test_pbar = tqdm(range(config['test_episodes']), desc="Testing", unit="episode")
+    for episode in test_pbar:
         obs = agent.env.reset()
         episode_reward = 0
         done = False
@@ -521,45 +543,40 @@ def test_model(test_episodes=10):
                 else:
                     status = "CRASH"
 
-                print(f"Test {episode + 1:2d}/{test_episodes} | Score: {episode_reward:7.2f} | {status}")
+                test_pbar.set_postfix({"Score": f"{episode_reward:.2f}", "Status": status})
                 break
+    test_pbar.close()
 
     print(
-        f"\nResults: Avg: {np.mean(total_rewards):.2f} | Success: {successes}/{test_episodes} ({100 * successes / test_episodes:.1f}%)")
+        f"\nResults: Avg: {np.mean(total_rewards):.2f} | Success: {successes}/{config['test_episodes']} ({100 * successes / config['test_episodes']:.1f}%)")
     agent.env.close()
 
 
 def main():
-    HPO_CONFIG = {
-        'n_trials': 50,
-        'hpo_timesteps': 100000,
-        'pruning_warmup': 50000,
-        'test_episodes': 5
+    CONFIG = {
+        # 环境配置
+        'game_id': "LunarLander-v3",  # 游戏环境名称
+        'continuous': True,  # 动作空间类型：True=连续动作，False=离散动作
+        'algorithm_name': "ppo",  # 强化学习算法名称
+        'auto_device': False,  # 是否自动选择设备：False=强制CPU，True=自动选GPU/MPS
+
+        # 步数限制
+        'max_episode_steps': 1000,  # 单个游戏回合最多玩多少步，防止卡死
+
+        # HPO配置（超参数优化）
+        'n_trials': 50,  # 尝试多少组不同的参数组合
+        'hpo_timesteps': 10000,  # 每组参数试验训练多少步
+        'pruning_warmup': 5000,  # 多少步后开始剪枝（提前停止差的试验）
+        'hpo_test_episodes': 5,  # 每组参数训练完后测试几个回合
+
+        # 最终训练配置
+        'final_timesteps': 200000,  # 用最佳参数最终训练多少步
+        'test_episodes': 15  # 最终模型测试多少个回合
     }
 
-    FINAL_TIMESTEPS = 200000
-    TEST_EPISODES = 15
-
-    print(f"{GAME_ID} {ALGORITHM_NAME.upper()} + Optuna HPO")
-    print("=" * 40)
-    print(f"Environment: {GAME_ID} | Continuous: {CONTINUOUS} | Algorithm: {ALGORITHM_NAME.upper()}")
-    print(f"Auto Device: {AUTO_DEVICE}")
-    print("Configuration:")
-    for key, value in HPO_CONFIG.items():
-        print(f"  {key}: {value}")
-    print(f"  final_timesteps: {FINAL_TIMESTEPS:,}")
-    print(f"  test_episodes: {TEST_EPISODES}")
-    print("=" * 40)
-    print(f"\n{ALGORITHM_NAME.upper()} Parameter Ranges (RL Zoo Standards):")
-    print("  learning_rate: 1e-5 to 1e-1 (log)")
-    print("  n_steps: [256, 512, 1024, 2048]")
-    print("  batch_size: [32, 64, 128, 256, 512]")
-    print("  n_epochs: [3, 5, 10, 20]")
-    print("  gamma: 0.98 to 0.999")
-    print("  clip_range: 0.1 to 0.3")
-    print("  net_arch: [32x32, 64x64, 128x128, 256x256]")
-    print("  ent_coef: 1e-8 to 1e-2 (log)")
-    print("=" * 40)
+    print(
+        f"Environment: {CONFIG['game_id']} | Continuous: {CONFIG['continuous']} | Algorithm: {CONFIG['algorithm_name'].upper()}")
+    print(f"Auto Device: {CONFIG['auto_device']}")
 
     print("\nSelect Mode:")
     print("  1 - Run HPO")
@@ -572,14 +589,14 @@ def main():
 
         if mode == "1":
             print("Starting HPO...")
-            run_hpo(HPO_CONFIG)
+            run_hpo(CONFIG)
             break
         elif mode == "2":
             print("Training final model...")
-            train_with_best_params(FINAL_TIMESTEPS)
+            train_with_best_params(CONFIG)
             break
         elif mode == "3":
-            test_model(TEST_EPISODES)
+            test_model(CONFIG)
             break
         elif mode == "4":
             print("Exit")
