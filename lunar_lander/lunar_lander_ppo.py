@@ -543,7 +543,7 @@ def main():
     CONFIG = {
         # 环境配置
         'game_id': "LunarLander-v3",  # 游戏环境名称
-        'continuous': True,  # 动作空间类型：True=连续动作，False=离散动作
+        'continuous': False,  # 动作空间类型：True=连续动作，False=离散动作
         'algorithm_name': "ppo",  # 强化学习算法名称
         'auto_device': False,  # 是否自动选择设备：False=强制CPU，True=自动选GPU/MPS
 
@@ -557,7 +557,7 @@ def main():
         'hpo_test_episodes': 300,  # 每组参数训练完后测试几个回合
 
         # 最终训练配置
-        'final_timesteps': 200000,  # 用最佳参数最终训练多少步
+        'final_timesteps': 500000,  # 用最佳参数最终训练多少步
         'test_episodes': 15  # 最终模型测试多少个回合
     }
 

@@ -133,7 +133,7 @@ class RLAgent:
 
             policy_kwargs = {
                 "net_arch": params['net_arch'],
-                "activation_fn": nn.ReLU,
+                "activation_fn": nn.ReLU
             }
 
             self.model = DQN(
@@ -151,7 +151,6 @@ class RLAgent:
                 exploration_fraction=params['exploration_fraction'],
                 exploration_initial_eps=params['exploration_initial_eps'],
                 exploration_final_eps=params['exploration_final_eps'],
-                max_grad_norm=10,
                 policy_kwargs=policy_kwargs,
                 device=device,
                 verbose=0
@@ -229,19 +228,22 @@ def objective(trial, config):
     }
 
     net_arch_str = trial.suggest_categorical('net_arch', ["64", "128", "256", "64x64", "128x128", "256x256"])
+    batch_size = trial.suggest_categorical('batch_size', [32, 64, 128, 256])
+    buffer_size = trial.suggest_categorical('buffer_size', [10000, 50000, 100000])
+    train_freq = trial.suggest_categorical('train_freq', [1, 4, 8])
 
     params = {
         'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True),
-        'buffer_size': trial.suggest_categorical('buffer_size', [10000, 50000, 100000, 500000]),
-        'learning_starts': trial.suggest_categorical('learning_starts', [1000, 5000, 10000]),
-        'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128, 256]),
+        'buffer_size': buffer_size,
+        'learning_starts': trial.suggest_categorical('learning_starts', [100, 1000, 5000]),
+        'batch_size': batch_size,
         'tau': trial.suggest_float('tau', 0.001, 0.1, log=True),
-        'gamma': trial.suggest_float('gamma', 0.95, 0.999),
-        'train_freq': trial.suggest_categorical('train_freq', [1, 4, 8, 16]),
+        'gamma': trial.suggest_float('gamma', 0.9, 0.999),
+        'train_freq': train_freq,
         'gradient_steps': trial.suggest_categorical('gradient_steps', [1, 2, 4]),
         'target_update_interval': trial.suggest_categorical('target_update_interval', [1000, 5000, 10000]),
         'exploration_fraction': trial.suggest_float('exploration_fraction', 0.1, 0.5),
-        'exploration_initial_eps': trial.suggest_float('exploration_initial_eps', 0.5, 1.0),
+        'exploration_initial_eps': trial.suggest_float('exploration_initial_eps', 0.8, 1.0),
         'exploration_final_eps': trial.suggest_float('exploration_final_eps', 0.01, 0.1),
         'net_arch': net_arch_map[net_arch_str]
     }
@@ -249,18 +251,20 @@ def objective(trial, config):
     study = trial.study
     completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
 
-    print(f"\n{'=' * 60}")
-    print(f"Trial {trial.number + 1} - Testing Parameters")
+    print(f"\n{'=' * 80}")
+    print(f"Trial {trial.number + 1} - Testing DQN Parameters")
     if completed_trials:
         best_trial = max(completed_trials, key=lambda t: t.value)
         print(f"Best So Far: Trial {best_trial.number + 1} - Score: {best_trial.value:.2f}")
     else:
         print(f"Best So Far: No previous trials")
-    print(f"{'=' * 60}")
+    print(f"{'=' * 80}")
     print(
-        f"LR: {params['learning_rate']:.2e} | Buffer: {params['buffer_size']} | Batch: {params['batch_size']} | Tau: {params['tau']:.3f}")
+        f"{'LR':<8}: {params['learning_rate']:<10.2e} {'Buffer':<8}: {params['buffer_size']:<10} {'Batch':<8}: {params['batch_size']:<10}")
     print(
-        f"Gamma: {params['gamma']:.3f} | Train Freq: {params['train_freq']} | Arch: {params['net_arch']} | Eps: {params['exploration_final_eps']:.3f}")
+        f"{'Tau':<8}: {params['tau']:<10.4f} {'Gamma':<8}: {params['gamma']:<10.3f} {'Arch':<8}: {str(params['net_arch']):<10}")
+    print(
+        f"{'ExpFrac':<8}: {params['exploration_fraction']:<10.2f} {'InitEps':<8}: {params['exploration_initial_eps']:<10.2f} {'FinalEps':<8}: {params['exploration_final_eps']:<10.3f}")
 
     agent = RLAgent(render_mode=None, config=config)
     return agent.train_with_params(
@@ -270,26 +274,6 @@ def objective(trial, config):
         pruning_warmup=config['pruning_warmup'],
         test_episodes=config['hpo_test_episodes']
     )
-
-
-def save_best_params(study, config):
-    best_params_to_save = study.best_params.copy()
-
-    net_arch_map = {
-        "64": [64],
-        "128": [128],
-        "256": [256],
-        "64x64": [64, 64],
-        "128x128": [128, 128],
-        "256x256": [256, 256]
-    }
-    if 'net_arch' in best_params_to_save and isinstance(best_params_to_save['net_arch'], str):
-        best_params_to_save['net_arch'] = net_arch_map[best_params_to_save['net_arch']]
-
-    params_file = f"{get_file_prefix(config)}_params.json"
-    with open(params_file, "w") as f:
-        json.dump(best_params_to_save, f, indent=2)
-    print(f"Best parameters saved to '{params_file}'")
 
 
 def run_hpo(config):
@@ -339,11 +323,20 @@ def run_hpo(config):
             best_arch = net_arch_map[best_arch]
 
         print(
-            f"LR: {best_params['learning_rate']:.2e} | Buffer: {best_params['buffer_size']} | Batch: {best_params['batch_size']} | Tau: {best_params['tau']:.3f}")
+            f"{'LR':<8}: {best_params['learning_rate']:<10.2e} {'Buffer':<8}: {best_params['buffer_size']:<10} {'Batch':<8}: {best_params['batch_size']:<10}")
         print(
-            f"Gamma: {best_params['gamma']:.3f} | Train Freq: {best_params['train_freq']} | Arch: {best_arch} | Eps: {best_params['exploration_final_eps']:.3f}")
+            f"{'Tau':<8}: {best_params['tau']:<10.4f} {'Gamma':<8}: {best_params['gamma']:<10.3f} {'Arch':<8}: {str(best_arch):<10}")
 
-        save_best_params(study, config)
+        best_params_to_save = study.best_params.copy()
+        net_arch_map = {"64": [64], "128": [128], "256": [256], "64x64": [64, 64], "128x128": [128, 128],
+                        "256x256": [256, 256]}
+        if 'net_arch' in best_params_to_save and isinstance(best_params_to_save['net_arch'], str):
+            best_params_to_save['net_arch'] = net_arch_map[best_params_to_save['net_arch']]
+
+        params_file = f"{get_file_prefix(config)}_params.json"
+        with open(params_file, "w") as f:
+            json.dump(best_params_to_save, f, indent=2)
+        print(f"Best parameters saved to '{params_file}'")
 
     except KeyboardInterrupt:
         print(f"\nHPO interrupted!")
@@ -365,11 +358,20 @@ def run_hpo(config):
                 best_arch = net_arch_map[best_arch]
 
             print(
-                f"LR: {best_params['learning_rate']:.2e} | Buffer: {best_params['buffer_size']} | Batch: {best_params['batch_size']} | Tau: {best_params['tau']:.3f}")
+                f"{'LR':<8}: {best_params['learning_rate']:<10.2e} {'Buffer':<8}: {best_params['buffer_size']:<10} {'Batch':<8}: {best_params['batch_size']:<10}")
             print(
-                f"Gamma: {best_params['gamma']:.3f} | Train Freq: {best_params['train_freq']} | Arch: {best_arch} | Eps: {best_params['exploration_final_eps']:.3f}")
+                f"{'Tau':<8}: {best_params['tau']:<10.4f} {'Gamma':<8}: {best_params['gamma']:<10.3f} {'Arch':<8}: {str(best_arch):<10}")
 
-            save_best_params(study, config)
+            best_params_to_save = study.best_params.copy()
+            net_arch_map = {"64": [64], "128": [128], "256": [256], "64x64": [64, 64], "128x128": [128, 128],
+                            "256x256": [256, 256]}
+            if 'net_arch' in best_params_to_save and isinstance(best_params_to_save['net_arch'], str):
+                best_params_to_save['net_arch'] = net_arch_map[best_params_to_save['net_arch']]
+
+            params_file = f"{get_file_prefix(config)}_params.json"
+            with open(params_file, "w") as f:
+                json.dump(best_params_to_save, f, indent=2)
+            print(f"Current best saved to '{params_file}'")
         else:
             print(f"No trials completed yet (interrupted during trial {total_trials})")
             if total_trials > 0:
@@ -411,14 +413,8 @@ def train_with_best_params(config):
     with open(params_file, "r") as f:
         best_params = json.load(f)
 
-    net_arch_map = {
-        "64": [64],
-        "128": [128],
-        "256": [256],
-        "64x64": [64, 64],
-        "128x128": [128, 128],
-        "256x256": [256, 256]
-    }
+    net_arch_map = {"64": [64], "128": [128], "256": [256], "64x64": [64, 64], "128x128": [128, 128],
+                    "256x256": [256, 256]}
 
     if isinstance(best_params['net_arch'], str):
         best_params['net_arch'] = net_arch_map[best_params['net_arch']]
@@ -543,16 +539,23 @@ def test_model(config):
 
 def main():
     CONFIG = {
-        'game_id': "LunarLander-v3",
-        'algorithm_name': "dqn",
-        'auto_device': False,
-        'max_episode_steps': 1000,
-        'n_trials': 50,
-        'hpo_timesteps': 2000,
-        'pruning_warmup': 500,
-        'hpo_test_episodes': 50,
-        'final_timesteps': 2000000,
-        'test_episodes': 20
+        # Environment configuration
+        'game_id': "LunarLander-v3",  # Game environment name
+        'algorithm_name': "dqn",  # Reinforcement learning algorithm name
+        'auto_device': False,  # Auto device selection: False=force CPU, True=auto GPU/MPS
+
+        # Step limits
+        'max_episode_steps': 1000,  # Max steps per episode to prevent infinite loops
+
+        # HPO configuration (Hyperparameter Optimization)
+        'n_trials': 50,  # Number of different parameter combinations to try
+        'hpo_timesteps': 100000,  # Training steps per parameter trial
+        'pruning_warmup': 25000,  # Steps before starting pruning (early stopping of bad trials)
+        'hpo_test_episodes': 300,  # Test episodes after each parameter trial
+
+        # Final training configuration
+        'final_timesteps': 500000,  # Final training steps with best parameters
+        'test_episodes': 15  # Final model test episodes
     }
 
     print(f"Environment: {CONFIG['game_id']} | Algorithm: {CONFIG['algorithm_name'].upper()}")
