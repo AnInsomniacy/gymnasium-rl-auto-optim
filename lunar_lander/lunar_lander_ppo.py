@@ -218,11 +218,6 @@ class RLAgent:
                 self.env.close()
 
 
-def get_valid_batch_sizes(n_steps):
-    all_batch_sizes = [32, 64, 128, 256, 512, 1024, 2048]
-    return [bs for bs in all_batch_sizes if bs <= n_steps and n_steps % bs == 0]
-
-
 def objective(trial, config):
     net_arch_map = {
         "32x32": [32, 32],
@@ -233,17 +228,7 @@ def objective(trial, config):
 
     net_arch_str = trial.suggest_categorical('net_arch', ["32x32", "64x64", "128x128", "256x256"])
     n_steps = trial.suggest_categorical('n_steps', [256, 512, 1024, 2048])
-    batch_size_raw = trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512, 1024, 2048])
-
-    valid_batch_sizes = get_valid_batch_sizes(n_steps)
-    if batch_size_raw not in valid_batch_sizes:
-        batch_size = min([bs for bs in valid_batch_sizes if bs <= batch_size_raw], default=valid_batch_sizes[0])
-    else:
-        batch_size = batch_size_raw
-
-    if batch_size != batch_size_raw:
-        trial.set_user_attr('corrected_batch_size', batch_size)
-        trial.set_user_attr('original_batch_size', batch_size_raw)
+    batch_size = trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512, 1024, 2048])
 
     params = {
         'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-1, log=True),
@@ -271,8 +256,6 @@ def objective(trial, config):
         f"{'LR':<8}: {params['learning_rate']:<10.2e} {'Steps':<8}: {params['n_steps']:<10} {'Batch':<8}: {params['batch_size']:<10} {'Epochs':<8}: {params['n_epochs']}")
     print(
         f"{'Gamma':<8}: {params['gamma']:<10.3f} {'Clip':<8}: {params['clip_range']:<10.2f} {'Arch':<8}: {str(params['net_arch']):<10} {'Ent':<8}: {params['ent_coef']:.2e}")
-    if batch_size != batch_size_raw:
-        print(f"Note: Batch size adjusted from {batch_size_raw} to {batch_size} (n_steps constraint)")
 
     agent = RLAgent(render_mode=None, config=config)
     return agent.train_with_params(
@@ -282,30 +265,6 @@ def objective(trial, config):
         pruning_warmup=config['pruning_warmup'],
         test_episodes=config['hpo_test_episodes']
     )
-
-
-def save_best_params(study, config):
-    best_params_to_save = study.best_params.copy()
-
-    best_trial = study.best_trial
-    if 'corrected_batch_size' in best_trial.user_attrs:
-        best_params_to_save['batch_size'] = best_trial.user_attrs['corrected_batch_size']
-        print(
-            f"Used corrected batch_size: {best_trial.user_attrs['corrected_batch_size']} (original: {best_trial.user_attrs['original_batch_size']})")
-
-    net_arch_map = {
-        "32x32": [32, 32],
-        "64x64": [64, 64],
-        "128x128": [128, 128],
-        "256x256": [256, 256]
-    }
-    if 'net_arch' in best_params_to_save and isinstance(best_params_to_save['net_arch'], str):
-        best_params_to_save['net_arch'] = net_arch_map[best_params_to_save['net_arch']]
-
-    params_file = f"{get_file_prefix(config)}_params.json"
-    with open(params_file, "w") as f:
-        json.dump(best_params_to_save, f, indent=2)
-    print(f"Best parameters saved to '{params_file}'")
 
 
 def run_hpo(config):
@@ -354,16 +313,25 @@ def run_hpo(config):
             net_arch_map = {"32x32": [32, 32], "64x64": [64, 64], "128x128": [128, 128], "256x256": [256, 256]}
             best_arch = net_arch_map[best_arch]
 
-        display_batch_size = best_params['batch_size']
-        if 'corrected_batch_size' in best_trial.user_attrs:
-            display_batch_size = best_trial.user_attrs['corrected_batch_size']
-
         print(
-            f"{'LR':<8}: {best_params['learning_rate']:<10.2e} {'Steps':<8}: {best_params['n_steps']:<10} {'Batch':<8}: {display_batch_size:<10} {'Epochs':<8}: {best_params['n_epochs']}")
+            f"{'LR':<8}: {best_params['learning_rate']:<10.2e} {'Steps':<8}: {best_params['n_steps']:<10} {'Batch':<8}: {best_params['batch_size']:<10} {'Epochs':<8}: {best_params['n_epochs']}")
         print(
             f"{'Gamma':<8}: {best_params['gamma']:<10.3f} {'Clip':<8}: {best_params['clip_range']:<10.2f} {'Arch':<8}: {str(best_arch):<10} {'Ent':<8}: {best_params['ent_coef']:.2e}")
 
-        save_best_params(study, config)
+        best_params_to_save = study.best_params.copy()
+        net_arch_map = {
+            "32x32": [32, 32],
+            "64x64": [64, 64],
+            "128x128": [128, 128],
+            "256x256": [256, 256]
+        }
+        if 'net_arch' in best_params_to_save and isinstance(best_params_to_save['net_arch'], str):
+            best_params_to_save['net_arch'] = net_arch_map[best_params_to_save['net_arch']]
+
+        params_file = f"{get_file_prefix(config)}_params.json"
+        with open(params_file, "w") as f:
+            json.dump(best_params_to_save, f, indent=2)
+        print(f"Best parameters saved to '{params_file}'")
 
     except KeyboardInterrupt:
         print(f"\nHPO interrupted!")
@@ -383,16 +351,25 @@ def run_hpo(config):
                 net_arch_map = {"32x32": [32, 32], "64x64": [64, 64], "128x128": [128, 128], "256x256": [256, 256]}
                 best_arch = net_arch_map[best_arch]
 
-            display_batch_size = best_params['batch_size']
-            if 'corrected_batch_size' in best_trial.user_attrs:
-                display_batch_size = best_trial.user_attrs['corrected_batch_size']
-
             print(
-                f"{'LR':<8}: {best_params['learning_rate']:<10.2e} {'Steps':<8}: {best_params['n_steps']:<10} {'Batch':<8}: {display_batch_size:<10} {'Epochs':<8}: {best_params['n_epochs']}")
+                f"{'LR':<8}: {best_params['learning_rate']:<10.2e} {'Steps':<8}: {best_params['n_steps']:<10} {'Batch':<8}: {best_params['batch_size']:<10} {'Epochs':<8}: {best_params['n_epochs']}")
             print(
                 f"{'Gamma':<8}: {best_params['gamma']:<10.3f} {'Clip':<8}: {best_params['clip_range']:<10.2f} {'Arch':<8}: {str(best_arch):<10} {'Ent':<8}: {best_params['ent_coef']:.2e}")
 
-            save_best_params(study, config)
+            best_params_to_save = study.best_params.copy()
+            net_arch_map = {
+                "32x32": [32, 32],
+                "64x64": [64, 64],
+                "128x128": [128, 128],
+                "256x256": [256, 256]
+            }
+            if 'net_arch' in best_params_to_save and isinstance(best_params_to_save['net_arch'], str):
+                best_params_to_save['net_arch'] = net_arch_map[best_params_to_save['net_arch']]
+
+            params_file = f"{get_file_prefix(config)}_params.json"
+            with open(params_file, "w") as f:
+                json.dump(best_params_to_save, f, indent=2)
+            print(f"Current best saved to '{params_file}'")
         else:
             print(f"No trials completed yet (interrupted during trial {total_trials})")
             if total_trials > 0:
@@ -564,17 +541,24 @@ def test_model(config):
 
 def main():
     CONFIG = {
-        'game_id': "LunarLander-v3",
-        'continuous': True,
-        'algorithm_name': "ppo",
-        'auto_device': False,
-        'max_episode_steps': 1000,
-        'n_trials': 50,
-        'hpo_timesteps': 200000,
-        'pruning_warmup': 50000,
-        'hpo_test_episodes': 500,
-        'final_timesteps': 2000000,
-        'test_episodes': 20
+        # 环境配置
+        'game_id': "LunarLander-v3",  # 游戏环境名称
+        'continuous': True,  # 动作空间类型：True=连续动作，False=离散动作
+        'algorithm_name': "ppo",  # 强化学习算法名称
+        'auto_device': False,  # 是否自动选择设备：False=强制CPU，True=自动选GPU/MPS
+
+        # 步数限制
+        'max_episode_steps': 1000,  # 单个游戏回合最多玩多少步，防止卡死
+
+        # HPO配置（超参数优化）
+        'n_trials': 50,  # 尝试多少组不同的参数组合
+        'hpo_timesteps': 100000,  # 每组参数试验训练多少步
+        'pruning_warmup': 25000,  # 多少步后开始剪枝（提前停止差的试验）
+        'hpo_test_episodes': 300,  # 每组参数训练完后测试几个回合
+
+        # 最终训练配置
+        'final_timesteps': 200000,  # 用最佳参数最终训练多少步
+        'test_episodes': 15  # 最终模型测试多少个回合
     }
 
     print(
