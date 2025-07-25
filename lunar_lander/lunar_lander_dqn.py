@@ -5,7 +5,7 @@ import os
 import signal
 import sys
 import pickle
-from stable_baselines3 import PPO
+from stable_baselines3 import DQN
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback
@@ -106,7 +106,6 @@ class RLAgent:
     def create_env(self):
         env = gym.make(
             self.config['game_id'],
-            continuous=self.config['continuous'],
             render_mode=self.render_mode,
             max_episode_steps=self.config['max_episode_steps']
         )
@@ -134,24 +133,25 @@ class RLAgent:
 
             policy_kwargs = {
                 "net_arch": params['net_arch'],
-                "activation_fn": nn.Tanh,
-                "ortho_init": True
+                "activation_fn": nn.ReLU,
             }
 
-            self.model = PPO(
+            self.model = DQN(
                 "MlpPolicy",
                 self.env,
                 learning_rate=params['learning_rate'],
-                n_steps=params['n_steps'],
+                buffer_size=params['buffer_size'],
+                learning_starts=params['learning_starts'],
                 batch_size=params['batch_size'],
-                n_epochs=params['n_epochs'],
+                tau=params['tau'],
                 gamma=params['gamma'],
-                gae_lambda=0.95,
-                clip_range=params['clip_range'],
-                ent_coef=params['ent_coef'],
-                vf_coef=0.5,
-                max_grad_norm=0.5,
-                normalize_advantage=True,
+                train_freq=params['train_freq'],
+                gradient_steps=params['gradient_steps'],
+                target_update_interval=params['target_update_interval'],
+                exploration_fraction=params['exploration_fraction'],
+                exploration_initial_eps=params['exploration_initial_eps'],
+                exploration_final_eps=params['exploration_final_eps'],
+                max_grad_norm=10,
                 policy_kwargs=policy_kwargs,
                 device=device,
                 verbose=0
@@ -218,42 +218,32 @@ class RLAgent:
                 self.env.close()
 
 
-def get_valid_batch_sizes(n_steps):
-    all_batch_sizes = [32, 64, 128, 256, 512, 1024, 2048]
-    return [bs for bs in all_batch_sizes if bs <= n_steps and n_steps % bs == 0]
-
-
 def objective(trial, config):
     net_arch_map = {
-        "32x32": [32, 32],
+        "64": [64],
+        "128": [128],
+        "256": [256],
         "64x64": [64, 64],
         "128x128": [128, 128],
         "256x256": [256, 256]
     }
 
-    net_arch_str = trial.suggest_categorical('net_arch', ["32x32", "64x64", "128x128", "256x256"])
-    n_steps = trial.suggest_categorical('n_steps', [256, 512, 1024, 2048])
-    batch_size_raw = trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512, 1024, 2048])
-
-    valid_batch_sizes = get_valid_batch_sizes(n_steps)
-    if batch_size_raw not in valid_batch_sizes:
-        batch_size = min([bs for bs in valid_batch_sizes if bs <= batch_size_raw], default=valid_batch_sizes[0])
-    else:
-        batch_size = batch_size_raw
-
-    if batch_size != batch_size_raw:
-        trial.set_user_attr('corrected_batch_size', batch_size)
-        trial.set_user_attr('original_batch_size', batch_size_raw)
+    net_arch_str = trial.suggest_categorical('net_arch', ["64", "128", "256", "64x64", "128x128", "256x256"])
 
     params = {
-        'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-1, log=True),
-        'n_steps': n_steps,
-        'batch_size': batch_size,
-        'n_epochs': trial.suggest_categorical('n_epochs', [3, 5, 10, 20]),
-        'gamma': trial.suggest_float('gamma', 0.98, 0.999),
-        'clip_range': trial.suggest_float('clip_range', 0.1, 0.3),
-        'net_arch': net_arch_map[net_arch_str],
-        'ent_coef': trial.suggest_float('ent_coef', 1e-8, 1e-2, log=True)
+        'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True),
+        'buffer_size': trial.suggest_categorical('buffer_size', [10000, 50000, 100000, 500000]),
+        'learning_starts': trial.suggest_categorical('learning_starts', [1000, 5000, 10000]),
+        'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128, 256]),
+        'tau': trial.suggest_float('tau', 0.001, 0.1, log=True),
+        'gamma': trial.suggest_float('gamma', 0.95, 0.999),
+        'train_freq': trial.suggest_categorical('train_freq', [1, 4, 8, 16]),
+        'gradient_steps': trial.suggest_categorical('gradient_steps', [1, 2, 4]),
+        'target_update_interval': trial.suggest_categorical('target_update_interval', [1000, 5000, 10000]),
+        'exploration_fraction': trial.suggest_float('exploration_fraction', 0.1, 0.5),
+        'exploration_initial_eps': trial.suggest_float('exploration_initial_eps', 0.5, 1.0),
+        'exploration_final_eps': trial.suggest_float('exploration_final_eps', 0.01, 0.1),
+        'net_arch': net_arch_map[net_arch_str]
     }
 
     study = trial.study
@@ -268,11 +258,9 @@ def objective(trial, config):
         print(f"Best So Far: No previous trials")
     print(f"{'=' * 60}")
     print(
-        f"{'LR':<8}: {params['learning_rate']:<10.2e} {'Steps':<8}: {params['n_steps']:<10} {'Batch':<8}: {params['batch_size']:<10} {'Epochs':<8}: {params['n_epochs']}")
+        f"LR: {params['learning_rate']:.2e} | Buffer: {params['buffer_size']} | Batch: {params['batch_size']} | Tau: {params['tau']:.3f}")
     print(
-        f"{'Gamma':<8}: {params['gamma']:<10.3f} {'Clip':<8}: {params['clip_range']:<10.2f} {'Arch':<8}: {str(params['net_arch']):<10} {'Ent':<8}: {params['ent_coef']:.2e}")
-    if batch_size != batch_size_raw:
-        print(f"Note: Batch size adjusted from {batch_size_raw} to {batch_size} (n_steps constraint)")
+        f"Gamma: {params['gamma']:.3f} | Train Freq: {params['train_freq']} | Arch: {params['net_arch']} | Eps: {params['exploration_final_eps']:.3f}")
 
     agent = RLAgent(render_mode=None, config=config)
     return agent.train_with_params(
@@ -287,14 +275,10 @@ def objective(trial, config):
 def save_best_params(study, config):
     best_params_to_save = study.best_params.copy()
 
-    best_trial = study.best_trial
-    if 'corrected_batch_size' in best_trial.user_attrs:
-        best_params_to_save['batch_size'] = best_trial.user_attrs['corrected_batch_size']
-        print(
-            f"Used corrected batch_size: {best_trial.user_attrs['corrected_batch_size']} (original: {best_trial.user_attrs['original_batch_size']})")
-
     net_arch_map = {
-        "32x32": [32, 32],
+        "64": [64],
+        "128": [128],
+        "256": [256],
         "64x64": [64, 64],
         "128x128": [128, 128],
         "256x256": [256, 256]
@@ -314,8 +298,7 @@ def run_hpo(config):
     STUDY_FILE = f"{get_file_prefix(config)}_study.pkl"
 
     print(f"Starting HPO for {config['game_id']} {config['algorithm_name'].upper()}")
-    print(
-        f"Environment: {config['game_id']} | Continuous: {config['continuous']} | Algorithm: {config['algorithm_name'].upper()}")
+    print(f"Environment: {config['game_id']} | Algorithm: {config['algorithm_name'].upper()}")
     print(f"Config: {config['n_trials']} trials x {config['hpo_timesteps']:,} steps")
     print("Press Ctrl+C to interrupt and save progress")
 
@@ -351,17 +334,14 @@ def run_hpo(config):
         best_params = study.best_params
         best_arch = best_params['net_arch']
         if isinstance(best_arch, str):
-            net_arch_map = {"32x32": [32, 32], "64x64": [64, 64], "128x128": [128, 128], "256x256": [256, 256]}
+            net_arch_map = {"64": [64], "128": [128], "256": [256], "64x64": [64, 64], "128x128": [128, 128],
+                            "256x256": [256, 256]}
             best_arch = net_arch_map[best_arch]
 
-        display_batch_size = best_params['batch_size']
-        if 'corrected_batch_size' in best_trial.user_attrs:
-            display_batch_size = best_trial.user_attrs['corrected_batch_size']
-
         print(
-            f"{'LR':<8}: {best_params['learning_rate']:<10.2e} {'Steps':<8}: {best_params['n_steps']:<10} {'Batch':<8}: {display_batch_size:<10} {'Epochs':<8}: {best_params['n_epochs']}")
+            f"LR: {best_params['learning_rate']:.2e} | Buffer: {best_params['buffer_size']} | Batch: {best_params['batch_size']} | Tau: {best_params['tau']:.3f}")
         print(
-            f"{'Gamma':<8}: {best_params['gamma']:<10.3f} {'Clip':<8}: {best_params['clip_range']:<10.2f} {'Arch':<8}: {str(best_arch):<10} {'Ent':<8}: {best_params['ent_coef']:.2e}")
+            f"Gamma: {best_params['gamma']:.3f} | Train Freq: {best_params['train_freq']} | Arch: {best_arch} | Eps: {best_params['exploration_final_eps']:.3f}")
 
         save_best_params(study, config)
 
@@ -380,17 +360,14 @@ def run_hpo(config):
             best_params = study.best_params
             best_arch = best_params['net_arch']
             if isinstance(best_arch, str):
-                net_arch_map = {"32x32": [32, 32], "64x64": [64, 64], "128x128": [128, 128], "256x256": [256, 256]}
+                net_arch_map = {"64": [64], "128": [128], "256": [256], "64x64": [64, 64], "128x128": [128, 128],
+                                "256x256": [256, 256]}
                 best_arch = net_arch_map[best_arch]
 
-            display_batch_size = best_params['batch_size']
-            if 'corrected_batch_size' in best_trial.user_attrs:
-                display_batch_size = best_trial.user_attrs['corrected_batch_size']
-
             print(
-                f"{'LR':<8}: {best_params['learning_rate']:<10.2e} {'Steps':<8}: {best_params['n_steps']:<10} {'Batch':<8}: {display_batch_size:<10} {'Epochs':<8}: {best_params['n_epochs']}")
+                f"LR: {best_params['learning_rate']:.2e} | Buffer: {best_params['buffer_size']} | Batch: {best_params['batch_size']} | Tau: {best_params['tau']:.3f}")
             print(
-                f"{'Gamma':<8}: {best_params['gamma']:<10.3f} {'Clip':<8}: {best_params['clip_range']:<10.2f} {'Arch':<8}: {str(best_arch):<10} {'Ent':<8}: {best_params['ent_coef']:.2e}")
+                f"Gamma: {best_params['gamma']:.3f} | Train Freq: {best_params['train_freq']} | Arch: {best_arch} | Eps: {best_params['exploration_final_eps']:.3f}")
 
             save_best_params(study, config)
         else:
@@ -435,7 +412,9 @@ def train_with_best_params(config):
         best_params = json.load(f)
 
     net_arch_map = {
-        "32x32": [32, 32],
+        "64": [64],
+        "128": [128],
+        "256": [256],
         "64x64": [64, 64],
         "128x128": [128, 128],
         "256x256": [256, 256]
@@ -453,7 +432,7 @@ def train_with_best_params(config):
     if os.path.exists(f"{FINAL_MODEL}.zip"):
         print("Continuing training of existing model")
         agent.env = agent.create_env()
-        agent.model = PPO.load(FINAL_MODEL, env=agent.env, device=device)
+        agent.model = DQN.load(FINAL_MODEL, env=agent.env, device=device)
 
         pbar = None
         try:
@@ -525,7 +504,7 @@ def test_model(config):
     agent = RLAgent(render_mode="human", config=config)
     agent.env = agent.create_env()
     device = get_device(config)
-    agent.model = PPO.load(f"{get_file_prefix(config)}_final", device=device)
+    agent.model = DQN.load(f"{get_file_prefix(config)}_final", device=device)
 
     total_rewards = []
     successes = 0
@@ -565,20 +544,18 @@ def test_model(config):
 def main():
     CONFIG = {
         'game_id': "LunarLander-v3",
-        'continuous': True,
-        'algorithm_name': "ppo",
+        'algorithm_name': "dqn",
         'auto_device': False,
         'max_episode_steps': 1000,
         'n_trials': 50,
-        'hpo_timesteps': 200000,
-        'pruning_warmup': 50000,
-        'hpo_test_episodes': 500,
+        'hpo_timesteps': 2000,
+        'pruning_warmup': 500,
+        'hpo_test_episodes': 50,
         'final_timesteps': 2000000,
         'test_episodes': 20
     }
 
-    print(
-        f"Environment: {CONFIG['game_id']} | Continuous: {CONFIG['continuous']} | Algorithm: {CONFIG['algorithm_name'].upper()}")
+    print(f"Environment: {CONFIG['game_id']} | Algorithm: {CONFIG['algorithm_name'].upper()}")
     print(f"Auto Device: {CONFIG['auto_device']}")
 
     print("\nSelect Mode:")
