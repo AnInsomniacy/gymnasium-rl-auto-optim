@@ -1,72 +1,19 @@
-import json
-import os
-import pickle
-import signal
-import sys
-
 import gymnasium as gym
 import numpy as np
-import optuna
+import json
+import os
+import signal
+import sys
+import pickle
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import BaseCallback
 import torch
 import torch.nn as nn
-from gymnasium.envs.box2d.lunar_lander import LunarLander
+import optuna
 from optuna.pruners import MedianPruner
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
 from tqdm import tqdm
-
-
-class CustomLunarLander(LunarLander):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def reset(self, **kwargs):
-        observation, info = super().reset(**kwargs)
-        return observation, info
-
-    def step(self, action):
-        observation, original_reward, terminated, truncated, info = super().step(action)
-
-        custom_reward = self._calculate_custom_reward(observation, action, terminated)
-
-        return observation, custom_reward, terminated, truncated, info
-
-    def _calculate_custom_reward(self, observation, action, terminated):
-        x_pos, y_pos, x_vel, y_vel, angle, angular_vel, leg1, leg2 = observation
-        main_engine, lateral_engine = action
-
-        if y_pos > 0.5:
-            distance_penalty = -5.0 * abs(x_pos)
-            speed_penalty = -0.3 * abs(x_vel) - 0.1 * abs(y_vel)
-            angle_penalty = -0.5 * abs(angle)
-            fuel_penalty = 0.2 * abs(lateral_engine)
-
-        elif y_pos > 0.2:
-            distance_penalty = -3.0 * (x_pos ** 2 + y_pos ** 2) ** 0.5
-            speed_penalty = -0.8 * abs(x_vel) - 1.2 * abs(y_vel)
-            angle_penalty = -1.0 * abs(angle)
-            fuel_penalty = -0.1 * abs(main_engine) - 0.2 * abs(lateral_engine)
-
-        else:
-            distance_penalty = -2.0 * (x_pos ** 2 + y_pos ** 2) ** 0.5
-            speed_penalty = -3.0 * (abs(x_vel) + abs(y_vel))
-            angle_penalty = -4.0 * abs(angle) - 2.0 * abs(angular_vel)
-            fuel_penalty = 0.0
-
-        landing_bonus = 0.0
-        if leg1 and leg2:
-            if abs(x_vel) < 0.5 and abs(y_vel) < 0.5 and abs(angle) < 0.2:
-                landing_bonus = 100.0
-            else:
-                landing_bonus = 20.0
-
-        crash_penalty = -200.0 if (terminated and not (leg1 and leg2)) else 0.0
-
-        total_reward = distance_penalty + speed_penalty + angle_penalty + fuel_penalty + landing_bonus + crash_penalty
-
-        return total_reward
 
 
 def get_file_prefix(config):
@@ -157,17 +104,11 @@ class RLAgent:
         self.env = None
 
     def create_env(self):
-        if not hasattr(gym.envs.registration, 'CustomLunarLander-v1'):
-            gym.register(
-                id='CustomLunarLander-v1',
-                entry_point=CustomLunarLander,
-                max_episode_steps=self.config['max_episode_steps']
-            )
-
         env = gym.make(
-            'CustomLunarLander-v1',
+            self.config['game_id'],
             continuous=self.config['continuous'],
-            render_mode=self.render_mode
+            render_mode=self.render_mode,
+            max_episode_steps=self.config['max_episode_steps']
         )
         env = Monitor(env)
         return DummyVecEnv([lambda: env])
@@ -567,7 +508,7 @@ def test_model(config):
     successes = 0
 
     test_pbar = tqdm(range(config['test_episodes']), desc="Testing", unit="episode")
-    for _ in test_pbar:
+    for episode in test_pbar:
         obs = agent.env.reset()
         episode_reward = 0
         done = False
@@ -600,17 +541,24 @@ def test_model(config):
 
 def main():
     CONFIG = {
-        'game_id': "LunarLander-v3",
-        'continuous': True,
-        'algorithm_name': "ppo",
-        'auto_device': False,
-        'max_episode_steps': 1000,
-        'n_trials': 50,
-        'hpo_timesteps': 100000,
-        'pruning_warmup': 25000,
-        'hpo_test_episodes': 300,
-        'final_timesteps': 500000,
-        'test_episodes': 15
+        # 环境配置
+        'game_id': "LunarLander-v3",  # 游戏环境名称
+        'continuous': False,  # 动作空间类型：True=连续动作，False=离散动作
+        'algorithm_name': "ppo",  # 强化学习算法名称
+        'auto_device': False,  # 是否自动选择设备：False=强制CPU，True=自动选GPU/MPS
+
+        # 步数限制
+        'max_episode_steps': 1000,  # 单个游戏回合最多玩多少步，防止卡死
+
+        # HPO配置（超参数优化）
+        'n_trials': 50,  # 尝试多少组不同的参数组合
+        'hpo_timesteps': 100000,  # 每组参数试验训练多少步
+        'pruning_warmup': 25000,  # 多少步后开始剪枝（提前停止差的试验）
+        'hpo_test_episodes': 300,  # 每组参数训练完后测试几个回合
+
+        # 最终训练配置
+        'final_timesteps': 200000,  # 用最佳参数最终训练多少步
+        'test_episodes': 15  # 最终模型测试多少个回合
     }
 
     print(
