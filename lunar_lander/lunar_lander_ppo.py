@@ -543,7 +543,7 @@ def main():
     CONFIG = {
         # 环境配置
         'game_id': "LunarLander-v3",  # 游戏环境名称
-        'continuous': False,  # 动作空间类型：True=连续动作，False=离散动作
+        'continuous': True,  # 动作空间类型：True=连续动作，False=离散动作
         'algorithm_name': "ppo",  # 强化学习算法名称
         'auto_device': False,  # 是否自动选择设备：False=强制CPU，True=自动选GPU/MPS
 
